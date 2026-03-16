@@ -1,0 +1,1145 @@
+---
+title: "Seneca_drums2"
+author: "Erin Hassett"
+date: "2025-11-10"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+
+setwd("C:/Erin/Seneca_Drums") #change to your wd
+#methane data from LiCOR
+pocks<- readxl::read_xlsx("ProcessedConcs2.xlsx")
+pocks<- pocks[-1,]
+```
+# Reading in Picarro Data
+```{r}
+#data from the Picarro (isotopes and gas)
+df_picarro <- readxl::read_xlsx("SenecaDrums_IsotopeRatioData.xlsx",sheet = "DataComp")
+df_picarro$Dilution[is.na(df_picarro$Dilution)] <- 1 # setting non-diluted samples to dilution factor of 1
+
+# Selecting for HR or HP methane depending on measured concentration (>10ppm = HR) and cleaning up columns
+df_picarro <- df_picarro %>%
+  mutate(CH4.Conc = if_else(HR.CH4 > 10,HR.CH4/Dilution,HP.CH4/Dilution),
+         CH4.std = if_else(HR.CH4 > 10,HR.CH4.std,HP.CH4.std),
+         d13C.CH4 = if_else(HR.CH4 > 10, HR.d13C,HP.d13C),
+         d13C.CH4.std = if_else(HR.CH4 > 10, HR.d13C.std,HP.d13C.std)) %>%
+  dplyr::select(-c(4,5,6,7,10,11,12,13)) %>%
+  drop_na(CH4.Conc)
+
+# Separating full Name into components
+df_picarro <- df_picarro %>%
+  separate(
+    col = Name,
+    into = c("Pockmark", "in.out", "Site","rep"),
+    sep = "_",
+    remove = FALSE)
+```
+##renaming duplicate Names
+```{r}
+#the dilutions cause issues with having the same identical name. But I want to keep the lowest dilution to be the one that gets compared to ESF data. 
+df_picarro2 <- df_picarro %>%
+  group_by(Name) %>%
+  arrange(desc(Dilution), .by_group = TRUE) %>% # highest dilution first
+  mutate(
+    n = n(), # of duplicates
+    idx = row_number(),  # 1 = highest dilution
+    Name = case_when(
+      n == 1 ~ Name, # only one row = keep name
+      idx == n ~ Name,  # lowest dilution = keep name
+      TRUE ~ paste0(Name, idx))) %>%# others =add suffix
+    ungroup()
+
+df_picarro2$Name[df_picarro2$Name == 'Abyssal_out_NW'] <- 'Abyssal_in_NW' #in/out doesn't really exist, so for having common names across sites, changing this to in. 
+```
+#merge datasets
+```{r}
+#LiCOR methane + Picarro methane/isotopes merged together
+#dataframe keeping ALL rows from both datasets
+#mergedall <- merge(pocks, df_picarro2, by = "Name", all=TRUE)
+#mergedall$VialC <-as.numeric(mergedall$VialC)
+#mergedall$VialC_ppm <- (mergedall$VialC/1000)
+#mergedall$difference <- mergedall$CH4.Conc - mergedall$VialC_ppm
+#write.csv(mergedall, "mergedall2.csv", row.names = FALSE)
+
+#df only keeping rows where Name is the same across both datasets (removes zero/3 ppms, BigTank etc= only pockmarks)
+merged <- merge(pocks, df_picarro2, by = "Name")
+merged$C_wat0 <-as.numeric(merged$C_wat0)
+merged$VialC <-as.numeric(merged$VialC)
+merged$VialC_ppm <- (merged$VialC/1000)
+merged$CH4.Conc <-as.numeric(merged$CH4.Conc)
+merged$difference <- merged$CH4.Conc - merged$VialC_ppm
+merged$abs_diff <- abs(merged$difference)
+```
+#find outliers
+```{r}
+#Couple vials were bad (based on major sensor disagreement). Locate them and tag as outliers
+# looking at absolute value of the difference
+Q1 <- quantile(merged$abs_diff, 0.25, na.rm = TRUE)
+Q3 <- quantile(merged$abs_diff, 0.75, na.rm = TRUE)
+IQR <- Q3 - Q1
+lower_bound <- Q1 - 3 * IQR
+upper_bound <- Q3 + 3 * IQR
+
+# flag it in the df
+merged$OutlierFlag <- ifelse(merged$abs_diff < lower_bound | merged$abs_diff > upper_bound, "Outlier", "Normal")
+
+# 12 Outliers Identified, but 2 are replicates (so 10 bad data points)
+```
+##Adjust outliers
+```{r}
+#Plot LiCOR methane as a function of Picarro Methane, and only look at data where there are no outliers (normal). Find the regression between the both, and everywhere the Licor data has an Outlier, correct that outlier value based on the regression slope and y. 
+model <- lm(VialC_ppm ~ CH4.Conc, data = merged[merged$OutlierFlag == "Normal", ])
+summary(model)
+
+merged$CH4_corrected <- merged$CH4.Conc
+merged$VialC_corrected <- merged$VialC_ppm
+
+m  <- coef(model)[2]  # slope
+b  <- coef(model)[1]  # intercept
+
+# Extract slope and R2
+coef(model)
+modslope <- coef(model)[2]
+modint <- coef(model)[1]
+mod_r2 <- summary(model)$r.squared
+
+#Correcting the values for the "outlier" samples where there was a large discrepancy between both instruments. 
+
+for (i in seq_len(nrow(merged))) {
+  if (merged$OutlierFlag[i] == "Outlier") {
+    if (merged$CH4.Conc[i] > merged$VialC_ppm[i]) {
+      merged$CH4_corrected[i] <- (merged$VialC_ppm[i] - b) / m} 
+    else {
+      merged$VialC_corrected[i] <- m * merged$CH4.Conc[i] + b}}}
+
+#show only outliers
+merged_short <-merged %>%
+  filter(OutlierFlag=="Outlier")%>%
+  dplyr::select(Name,CH4.Conc,VialC_ppm,CH4_corrected,VialC_corrected)
+
+#show only clean dataframe
+merged_clean <-merged %>%
+  dplyr::filter(OutlierFlag != "Outlier")
+  
+ggplot(merged_clean, aes(x =CH4.Conc, y=VialC_ppm)) +
+ geom_point() +
+  geom_smooth(method = "lm",se = FALSE,color = "black")+
+  theme_bw() +
+  theme(axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = expression(CH[4]~"flux (µmol m"^-2~"s"^-1~") Cornell"),
+       y = expression(CH[4]~"flux (µmol m"^-2~"s"^-1~") ESF"))+
+  annotate("text", 
+        x = Inf, y = -Inf, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(modslope, 2),
+                       "\nY-int = ", round(modint, 2),
+                          "\nR² = ", round(mod_r2, 2)))
+
+#write.csv(merged_short, "C:/Erin/Seneca_Drums/Outliers.csv")
+#write.csv(merged, "C:/Erin/Seneca_Drums/CH4_full.csv")
+```
+#CWat0= CH4 dissolved
+```{r}
+#Cwat0 is the concentration that is in the water when we drew the sample (most derived of the vial): BEST TO USE= aquatic concentrations
+#since methane from the licor was adjusted for some bad outliers with the clean vialC_corrected column, we need to make sure Cwat0 is also adjusted for those select vials that were "bad"
+
+#recalculate Cwat0 using VialC_corrected
+
+#keep constants
+CH4 <- data.frame(kH = 0.0014, dlnkHdinvT = 1600)
+pbar <- 991.15 * 0.001     # pressure bar
+rho_wat <- 0.001           # Water density (kg mL-1)
+R <- 0.0831446261815 * 1000  # gas constant mL bar K-1 mol-1
+# Initial gas-phase concentration (ppm -> mol mL-1)
+C_gas0 <- 3
+C_gas0 <- C_gas0 * pbar / R / (21.11 + 273.15)#Assumed at ambient temp. Could be refined
+
+#convert to numeric
+merged$WAT_TEMP<-as.numeric(merged$WAT_TEMP)
+merged$BOAT_AIR_VOL<-as.numeric(merged$BOAT_AIR_VOL)
+merged$BOAT_WAT_VOL<-as.numeric(merged$BOAT_WAT_VOL)
+
+#temperature corrected Henrys constant
+merged$kH <- CH4$kH * exp(
+  CH4$dlnkHdinvT *
+    (1 / (merged$WAT_TEMP + 273.15) - 1 / 298.15))
+
+#original calculatations, using VialC (not yet converted to ppm) <- <- just confirming math here is the same as original calculations done by Tim. 
+#data$WatC1<-data$VialC/(10^9)*pbar*kH*rho_wat #mol/mL
+merged$WatC1_raw <- (merged$VialC / 10^9) *
+                    pbar * merged$kH * rho_wat #mol/mL
+
+#data$GasC1<-data$VialC*pbar/R/(data$WAT_TEMP+273.15)/(10^9) #mol/mL
+merged$GasC1_raw <- merged$VialC * pbar / R /
+                    (merged$WAT_TEMP + 273.15) / (10^9)
+
+merged$cWat_0_raw=(merged$GasC1_raw*merged$BOAT_AIR_VOL+merged$WatC1_raw*-C_gas0*merged$BOAT_AIR_VOL)/merged$BOAT_WAT_VOL #mol mL-1
+
+#using the clean, fixed VialC_corrected
+#divide by 1e6 not 1e9 because VialC corrected is in ppm now. 
+merged$WatC1_corr <- (merged$VialC_corrected / 1e6) *
+                     pbar * merged$kH * rho_wat
+
+merged$GasC1_corr <- merged$VialC_corrected * pbar / R /
+                     (merged$WAT_TEMP + 273.15) / 1e6
+
+#variable of cWat_0 but with fixed data. 
+merged$cWat_0_corr <- (merged$GasC1_corr*merged$BOAT_AIR_VOL+merged$WatC1_corr*-C_gas0*merged$BOAT_AIR_VOL)/merged$BOAT_WAT_VOL
+
+merged$cWat_0_corr2<-merged$cWat_0_corr * 1e9 #nmol
+
+colnames (merged)
+#trim down to have tidy datafrme with important variables. 
+merged2<- merged %>%
+  dplyr::select(Date, Name, Site_Num, Pockmark, in.out, Site, Depth, 
+         OutlierFlag, CH4.Conc,CH4_corrected,VialC_ppm, 
+         VialC_corrected,C_wat0,cWat_0_corr,cWat_0_corr2)
+```
+#Add DEC Data
+```{r}
+#Date EXO2 data (python-output df) and the chloride water samples to the methane dateframe
+library(lubridate)
+clbr <- read.csv("Cl_Br.csv") #chloride, only Pockmark IN
+python <- read.csv("PythonRv2.csv") #EXO2 sensor data
+python <- python %>%
+  filter(Comments != "TEST") #remove test data
+colnames(python)
+
+#remove blanks, trim down to only important columns
+clbr <- clbr %>%
+  filter(!grepl("Blank", SiteName))%>%
+  dplyr::select(Name, Cl_mgL)
+
+#last 5 samples taken from each EXO2 measurement and then averaged
+python5 <- python %>%
+  mutate(IN_OUT = tolower(IN_OUT),
+         datetime = mdy(Date) + hms(Time))  %>%
+  group_by(SiteName, IN_OUT, Cardinal) %>%
+  filter(!grepl("equipblank1", SiteName))%>%
+  filter(!grepl("equipblank2", SiteName))%>%
+  arrange(datetime, .by_group = TRUE) %>%
+  slice_tail(n = 5) %>%
+  summarise(
+    across(
+      where(is.numeric),
+      ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop") %>%
+  mutate(
+    Name = paste(SiteName, IN_OUT, Cardinal, sep = "_")) %>%
+ dplyr:: select(SiteName,Name, IN_OUT, Cond, ODOpercLocal, 
+                Press,Baro,pH,pHmv,Turb,TDS,SpCond,Sal)
+
+
+merged3 <- merge(merged2, python5, by = "Name", all=TRUE)
+merged4 <- merge(merged3, clbr, by = "Name", all=TRUE)
+all <- merged4
+all <- all[!is.na(all$Pockmark), ]
+all <- all[!is.na(all$Cond), ]
+
+#write.csv(all, "C:/Erin/Seneca_Drums/all_data_clean.csv")
+```
+#CH4 STATS
+```{r}
+library(car) #for model ANOVAs
+library(performance) #performance check
+library(DHARMa)  #performance check
+library(glmmTMB) #for fixed/random effects in models
+
+#we want model comparisons to be based on the mean across all factors, not the first level (alphabetical)
+options("contrasts")
+options(constrasts=c("contr.sum","contr.poly"))  #compares to  global mean rather than a reference variable
+#contrasts(all$Pockmark) <- contr.sum(levels(all$Pockmark))
+
+all$Site_Num<-as.factor(all$Site_Num)
+all$Site_Num <- factor(all$Site_Num, levels = c("A", "B", "1","2","3","4","5","6","7","8","9","10","11","12","13","14"))
+levels(all$Site_Num)
+
+all <- all %>%
+  mutate(sample_id = paste(Site_Num, in.out, sep = "_"))
+
+#df with no controls (because these don't have In vs Out)
+treatments<- all  %>%
+  filter(!Pockmark=="Abyssal")%>%
+  filter(!Pockmark=="Belhurst") %>%
+  mutate(sample_id = paste(Site_Num, in.out, sep = "_"))
+
+#make column with control vs treatment
+all <- all %>%
+  mutate(cont_treat = case_when(
+    grepl("^(Abyssal_|Belhurst_)", Name) ~ "Control", TRUE~ "Treatment"))
+
+#make column with control vs each Pockmark Name retained
+#all <- all %>% mutate(Pockmark3 = case_when(grepl("^(Abyssal_|Belhurst_)", Name) ~ "Control",TRUE ~ Pockmark))
+
+all$sample_id<-as.factor(all$sample_id)
+all$sample_id <- factor(all$sample_id, levels = c("A_in","A_out", "B_in","B_out", "1_in","1_out", "2_in", "2_out", "3_in","3_out","4_in","4_out","5_in","5_out","6_in","6_out","7_in","7_out","8_in","8_out","9_in","9_out","10_in","10_out","11_in", "11_out","12_in","12_out","13_in","13_out","14_in","14_out"))
+
+levels(all$Site_Num)
+levels(all$sample_id)
+all$cont_treat<-as.factor(all$cont_treat)
+
+#all_in <- all %>%  filter(in.out =="in")
+#all_out <- all %>% filter(in.out =="out")
+
+```
+##ch4 ~ all sites
+```{r}
+library(multcompView) 
+library(multcomp) #cld letters for plots
+library(emmeans) #pairwise comparisons
+
+plot(all$cWat_0_corr)
+
+#random effect of Site_num/sample_id to account for replicates. This accounts for 1) overall site differences andd models in.out variablility. Wheras site_num:sample_id does not do that. 
+m_control <- glmmTMB(
+cWat_0_corr2 ~ Site_Num + (1 | Site_Num/sample_id), 
+#to inform the replicates I have per sample
+family = Gamma(link = "log"),
+data = all)
+summary(m_control)
+car::Anova(m_control)
+#check_model(m_control)
+#simulate_residuals(m_control)
+pock_lett<-emmeans(m_control, ~Site_Num, type="response") %>%
+multcomp::cld(Letters = "abcdefghijk")
+
+```
+##pockmark * in_out
+```{r}
+#Treatments ONLY (true pockmarks, not controls)
+
+#continuous data that is skewed.Tried tweedie= did not converge.Gaussian, also bad fit, indicated by residuals.Controls (belhurst/abyssal excluded from this analysis because they don't have in/out which would cause singularity)  
+test<-glmmTMB(
+  cWat_0_corr2 ~ Site_Num * in.out + (1 | Site_Num/in.out),
+  family = Gamma(link="log"),
+  data = treatments) #excludes Abyssal and Belhurst
+summary(test)
+car::Anova(test, type=3)
+#check_model(test) #VIF OK because of nesting structure. 
+#simulateResiduals(test, plot=TRUE)
+
+meth_abc<-emmeans(test, ~Site_Num, type="response") %>% 
+multcomp::cld(Letters = "abcdefghijk")
+
+meth_in<-emmeans(test, ~in.out|Site_Num, type="response") %>%
+multcomp::cld(Letters = "abcdefghijk")
+
+test2<-glmmTMB(
+  cWat_0_corr2 ~ in.out + (1 | Site_Num/in.out),
+  family = Gamma(link="log"),
+  data = treatments)
+summary(test2) #borderline 
+car::Anova(test2, type=3)
+#simulateResiduals(test2, plot=TRUE)
+meth_in.out<-emmeans(test2, ~in.out, type="response") %>% 
+multcomp::cld(Letters = "abcd")
+```
+##control vs treat
+```{r}
+#controls 
+m_control_mixed <- glmmTMB(
+  cWat_0_corr2 ~ cont_treat + (1 | sample_id), 
+  family = Gamma(link="log"), 
+  data = all)
+summary(m_control_mixed)
+#check_model(m_control_mixed)
+#simulateResiduals(m_control_mixed, plot=TRUE)
+
+#no differnce between controls/treatment
+car::Anova(m_control_mixed, type=3)
+c_t_letters<-emmeans(m_control_mixed, ~cont_treat, type = "response") %>% 
+  multcomp::cld(Letters = "abcdefghijk")
+
+#emmeans(m_control_mixed, ~cont_treat, type = "response") %>%contrast("trt.vs.ctrl", ref = "Control")
+
+#check_model(m_control_mixed)
+```
+##CH4 ~exo2 mods
+```{r}
+#checking to see whether methane varied by other environmental variables, both as a whole and by Site specifically
+
+#We used linear mixed-effects models to assess the influence of environmental variables on methane fluxes while accounting for non-independence of observations within sites. Site was included as a random intercept, and environmental variables were treated as fixed effects. Methane fluxes were log-transformed to meet model assumptions.
+
+all$log_CH4 <- log(all$cWat_0_corr + 0.001)
+
+library(lme4)
+
+#1) model doesn't converge when using glmmTMB for random effects --> using lmer; 2) model doesn't converge with log_CH4 as y, or with sample_id as fixed effect. 3) when (1 | Site_Num/sample_id) = boundary (singular) fit: see help('isSingular'). 
+
+
+#TDS and SpCond = correlated. Removing TDS
+
+test_m1 <- lmer(cWat_0_corr2 ~ Depth+ SpCond+ODOpercLocal+Turb+ (1 | Site_Num),data = all)
+summary(test_m1)
+car::Anova(test_m1, type=3)
+#check_model(test_m1)
+
+#log transforming does not change much
+test_m2 <- lmer(log_CH4 ~ Depth+ SpCond+ODOpercLocal+Turb+ (1 | Site_Num),data = all)
+summary(test_m2)
+car::Anova(test_m2, type=3) #same as original test 1
+#check_model(test_m2)
+
+#scaling since all the variables have wildly different unit sizes. 
+all <- all |>
+  dplyr::mutate(
+    Depth_s   = scale(Depth),
+    SpCond_s  = scale(SpCond),
+    ODOperc_s = scale(ODOpercLocal),
+    TDS_s     = scale(TDS), #don't need
+    Turb_s    = scale(Turb))
+
+test_m3 <- lmer(cWat_0_corr2 ~ Depth_s+ SpCond_s+ODOperc_s+Turb_s+ (1 | Site_Num),data = all)
+summary(test_m3)
+car::Anova(test_m3, type=3)
+#check_model(test_m3)
+
+test_m4 <- lmer(log_CH4 ~ Depth_s+ SpCond_s+ODOperc_s+Turb_s+ (1 | Site_Num), data = all)
+summary(test_m4)
+car::Anova(test_m4, type=3)
+
+test_m5 <- lm(log_CH4 ~ Depth_s+ SpCond_s+ODOperc_s+Turb_s, data = all)
+summary(test_m5)
+
+#test 1 good. Other variations didn't improve, so sticking with the one that doesn't transform the data
+
+```
+###Turbidity outlier
+```{r}
+#the one turbidity point thhat was really high masked the significance of DO! Removed The Turb outlier (> 3 STD DEV)
+turb_mean <- mean(all$Turb, na.rm = TRUE)
+turb_sd   <- sd(all$Turb, na.rm = TRUE)
+
+# Flag outliers: TRUE if more than 3 SD from mean
+all$Turb_outlier <- abs(all$Turb - turb_mean) > 3 * turb_sd
+
+# Check how many outliers
+table(all$Turb_outlier)
+all_clean <- all[!all$Turb_outlier, ]
+
+#Table 2
+test_m6 <- lmer(cWat_0_corr2 ~ Depth+ SpCond+ODOpercLocal+Turb+ (1 | Site_Num),data = all_clean)
+summary(test_m6)
+car::Anova(test_m6, type=3)
+#check_model(test_m6)
+```
+##CH4 Plots
+###CH4~ EXO2/Cl
+```{r}
+library(ggeffects)
+#plot(ggpredict(test_m6, terms = "ODOpercLocal"))
+library(ggpubr) #ggarrange plots
+library(MuMIn)
+# cWat_0_corr2 = n mol / mL
+
+#all_in <- all %>% filter(in.out=="in")
+#max(all_in$cWat_0_corr2) #1.024362e-10
+#min(all_in$cWat_0_corr2) #4.656343e-11
+
+#all_out <- all %>% filter(in.out=="out")
+#max(all_out$cWat_0_corr2) #1.024362e-10
+#min(all_out$cWat_0_corr2) #4.656343e-11
+
+#max(all$cWat_0_corr2) #1.024362e-10
+#min(all$cWat_0_corr2) #4.656343e-11
+
+
+#same additive model as above, just moved again here for clarity
+test_m6 <- lmer(cWat_0_corr2 ~ Depth+ SpCond+ODOpercLocal+Turb+ (1 | Site_Num),data = all_clean)
+summary(test_m6)
+car::Anova(test_m6, type=3)
+
+r2_values <- r.squaredGLMM(test_m6)
+r2_marginal <- r2_values[1]
+r2_conditional <- r2_values[2]
+
+# Fixed effects
+coefs <- fixef(test_m6)
+
+# 2. DEPTH
+depth_eff <- ggpredict(test_m6, terms = "Depth")
+m_depth <- coefs["Depth"]
+b_depth <- coefs["(Intercept)"]
+
+
+CH4_depth <- ggplot() +
+  geom_point(data = all_clean,
+             aes(x = Depth, y = (cWat_0_corr2)),
+             alpha = 0.6) +
+  geom_line(data = depth_eff,
+            aes(x = x, y = predicted),
+            color = "black", size = 1) +
+  geom_ribbon(data = depth_eff,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2) +
+  theme_bw() +
+  theme(text = element_text(size = 14, family = "serif")) +
+  labs(x = "Depth (m)",
+       y = expression(CH[4]~(nmol~mL^-1))) +
+  annotate("text",
+           x = max(depth_eff$x),
+           y = max(depth_eff$predicted)+0.012,
+           hjust = 1,
+           label = paste0("Slope = ", signif(m_depth, 3),
+                          "\nIntercept = ", signif(b_depth, 3),
+                          "\nMarginal R² = ", round(r2_marginal, 2)))
+
+
+# 3. SPECIFIC CONDUCTIVITY
+
+sp_eff <- ggpredict(test_m6, terms = "SpCond")
+m_sp <- coefs["SpCond"]
+b_sp <- coefs["(Intercept)"]
+
+CH4_spcond <- ggplot() +
+  geom_point(data = all_clean,
+             aes(x = SpCond, y = cWat_0_corr2),
+             alpha = 0.6) +
+  geom_line(data = sp_eff,
+            aes(x = x, y = predicted),
+            color = "black", size = 1) +
+  geom_ribbon(data = sp_eff,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2) +
+  theme_bw() +
+  theme(text = element_text(size = 14, family = "serif")) +
+  labs(x =  expression(Specific~conductivity~(µg~L^-1)),
+        # "Specific conductivity (µg/L)",
+       y = expression(CH[4]~(nmol~mL^-1))) +
+  annotate("text",
+           x = max(sp_eff$x),
+           y = max(sp_eff$predicted)+0.012,
+           hjust = 1,
+           label = paste0("Slope = ", round(m_sp, 4),
+                          "\nIntercept = ", signif(b_sp, 3),
+                          "\nMarginal R² = ", round(r2_marginal, 2)))
+
+
+# 4. DISSOLVED OXYGEN
+do_eff <- ggpredict(test_m6, terms = "ODOpercLocal")
+m_do <- coefs["ODOpercLocal"]
+b_do <- coefs["(Intercept)"]
+
+CH4_DO <- ggplot() +
+  geom_point(data = all_clean,
+             aes(x = ODOpercLocal, y = cWat_0_corr2),
+             alpha = 0.6) +
+  geom_line(data = do_eff,
+            aes(x = x, y = predicted),
+            color = "black", size = 1) +
+  geom_ribbon(data = do_eff,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2) +
+  theme_bw() +
+  theme(text = element_text(size = 14, family = "serif")) +
+  labs(x = "Dissolved Oxygen (%)",
+       y = expression(CH[4]~(nmol~mL^-1))) +
+  annotate("text",
+           x = max(do_eff$x),
+           y = max(do_eff$predicted)+0.012,
+           hjust = 1,
+           label = paste0("Slope = ", round(m_do, 4),
+                          "\nIntercept = ", signif(b_do, 3),
+                          "\nMarginal R² = ", round(r2_marginal, 2)))
+
+
+# 5. TURBIDITY
+
+turb_eff <- ggpredict(test_m6, terms = "Turb")
+
+m_turb <- coefs["Turb"]
+b_turb <- coefs["(Intercept)"]
+
+CH4_Turb <- ggplot() +
+  geom_point(data = all_clean,
+             aes(x = Turb, y = cWat_0_corr2),
+             alpha = 0.6) +
+  geom_line(data = turb_eff,
+            aes(x = x, y = predicted),
+            color = "black", size = 1) +
+  geom_ribbon(data = turb_eff,
+              aes(x = x, ymin = conf.low, ymax = conf.high),
+              alpha = 0.2) +
+  theme_bw() +
+  theme(text = element_text(size = 14, family = "serif")) +
+  labs(x = "Turbidity (NFU)",
+       y = expression(CH[4]~(nmol~mL^-1))) +
+  annotate("text",
+           x = max(turb_eff$x),
+           y = max(turb_eff$predicted)+0.012,
+           hjust = 1,
+           label = paste0("Slope = ", round(m_turb, 4),
+                          "\nIntercept = ", signif(b_turb, 3),
+                          "\nMarginal R² = ", round(r2_marginal, 2)))
+
+ggarrange(CH4_depth,
+          CH4_DO,
+          CH4_spcond,
+          CH4_Turb,
+          ncol = 2,
+          nrow = 2,
+          labels = "auto")
+
+```
+###CH4 ~ Pockmarks
+```{r}
+library(ggpubr)
+#to ease interpretation, we changed the plot units to nmol/ mL instead of mol/ mL; however, the stats (sig letters) are based on the original data (mol/ML)
+
+dodge_width=0.7
+
+#methane in nm is used for the plot, but stats comes from meth_in model which is mol. 
+meth_in2 <- treatments %>%
+  group_by(Site_Num, in.out) %>%
+  summarise(y_max = max(cWat_0_corr2, na.rm = TRUE), .groups = "drop") %>%
+  left_join(meth_in, by = c("Site_Num", "in.out")) %>%
+  mutate(y_pos = y_max * 1.05) 
+
+p1<-ggplot(treatments, aes(x=Site_Num, y=cWat_0_corr2, fill=in.out)) +
+  geom_boxplot(alpha=0.7) +
+ # facet_grid(~Pockmark)+
+  #geom_jitter( alpha=0.3) +
+  labs(x = "",
+      y = expression(CH[4]~(nmol~mL^-1)))+
+    geom_text(
+    data = meth_in2,
+    aes(x = Site_Num, y = y_pos, label = .group),
+    position = position_dodge(width = dodge_width),
+    size = 3.5)+
+ # geom_text_repel(aes(label = meth_in), vjust = -0.5)+ 
+    #nudge_y=.1)+
+      # title="CH4 concentrations: in vs out") +
+  scale_fill_discrete(labels = c("in" = "In",
+                                 "out" = "Out"))+
+  theme_bw()+
+  theme(text = element_text(size = 12,family = "serif"),
+        axis.text.x = element_text(hjust=1),
+        legend.title=element_blank(),
+        legend.position = "right")
+
+c_t_letters2 <- all %>%
+  group_by(cont_treat) %>%
+  summarise(y_max = max(cWat_0_corr2, na.rm = TRUE), .groups = "drop") %>%
+  left_join(c_t_letters, by = c("cont_treat")) %>%
+  mutate(y_pos = y_max * 1.05) 
+
+
+p2<-ggplot(all, aes(x=cont_treat, y=cWat_0_corr2)) +
+  geom_boxplot(alpha=0.7) +
+ # facet_grid(~Pockmark)+
+  geom_jitter(width=0.15, alpha=0.3) +
+ # scale_y_continuous(trans="log10") + 
+  labs(x = "",
+    y = expression(CH[4]~(nmol~mL^-1)))+
+   geom_text(
+    data = c_t_letters2,
+    aes(x = cont_treat, y = y_pos, label = .group),
+    position = position_dodge(width = dodge_width),
+    size = 3.5)+
+      # title="CH4 concentrations: in vs out") +
+  theme_bw()+
+  theme(text = element_text(size = 12,family = "serif"),
+        legend.title=element_blank(),
+        legend.text = element_blank(),
+        legend.position = "none")
+
+
+meth_in.out2 <- treatments %>%
+  group_by(in.out) %>%
+  summarise(y_max = max(cWat_0_corr2, na.rm = TRUE), .groups = "drop") %>%
+  left_join(meth_in.out, by = c("in.out")) %>%
+  mutate(y_pos = y_max * 1.05) 
+
+
+p3<-ggplot(treatments, aes(x=in.out, y=cWat_0_corr2)) +
+  geom_boxplot(alpha=0.7) +
+  #stat_summary(fun.y = mean, geom = "point", shape = 18, size = 3, color = "darkred")+
+  #geom_jitter() +
+ labs( x="",y = expression(CH[4]~(nmol~mL^-1)))+
+    geom_text(data = meth_in.out2, size = 3.5,
+    aes(x = in.out, y = y_pos, label = .group))+
+  scale_x_discrete(labels = c("in" = "In",
+                              "out" = "Out"))+
+      # title="CH4 concentrations: in vs out") +
+  theme_bw() +
+  theme(text = element_text(size = 12,family = "serif"),
+        legend.title=element_blank(),
+        legend.position = "none")
+
+
+pock_lett2 <- all %>%
+  group_by(Site_Num) %>%
+  summarise(y_max = max(cWat_0_corr2, na.rm = TRUE), .groups = "drop") %>%
+  left_join(pock_lett, by = c("Site_Num")) %>%
+  mutate(y_pos = y_max * 1.05) 
+
+p4<-ggplot(all, aes(x=Site_Num, y=cWat_0_corr2)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+ # scale_y_continuous(trans="log10") + 
+ labs( x="", y = expression(CH[4]~(nmol~mL^-1)))+
+    geom_text(
+    data = pock_lett2,
+    aes(x = Site_Num, y = y_pos, label = .group),
+    size = 3.5)+
+    #vjust = -.5,
+   # nudge_y=.1)+
+      # title="CH4 concentrations by Pockmark") +
+  theme_bw() +
+  theme(text = element_text(size = 12,family = "serif"),
+    #axis.text.x = element_text( hjust=1),
+        axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5),
+    legend.position = "none")
+
+gg<-ggarrange(p2,p3, legend="none")
+ggarrange(p4, p1, p2, p3 ,nrow=2, ncol=2, align="hv", labels="auto")
+```
+#Chloride/SpCond
+##spcond= proxy
+```{r}
+#is Specific conductivity a proxy for Chloride?
+plot(all$SpCond)
+cl_cond <- lm(SpCond ~ Cl_mgL, data=all)
+summary(cl_cond)
+shapiro.test(residuals(cl_cond)) #0.02, not normal
+#cor.test(all$Cl_mgL, all$SpCond, method = "spearman")
+#plot(cl_cond)
+#check_model(cl_cond)
+#simulateResiduals(cl_cond, plot=TRUE)
+m_clsp  <- coef(cl_cond)[2]  # slope
+b_clsp  <- coef(cl_cond)[1]  # intercept
+r2_clsp <- summary(cl_cond)$r.squared
+
+#specific conductivity can be a proxy. Use this instead
+cond_cl_p<-ggplot(all, aes(x=Cl_mgL, y=SpCond)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+  ylim(630,725)+
+  theme_bw() +
+  theme(text = element_text(size = 12,family = "serif"),
+        axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x =  expression(Chloride~(mg~L^-1)),
+   # x = "Chloride (mg/L)",
+      y =  expression(Specific~conductivity~(µg~L^-1)))+
+      # y = "Specific Conductivity (µg/L)")+
+  annotate("text", 
+        x = 142, y = 650, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(m_clsp, 2),
+                       "\nY-int = ", round(b_clsp, 2),
+                          "\nR² = ", round(r2_clsp, 2)))
+```
+##Spcond ~all  site
+```{r}
+#does specific conductivity vary by all sites?
+SpCond_site <- glmmTMB(
+  SpCond ~ Site_Num +(1|sample_id),
+  family = Gamma(link = "log"),
+  data = all)
+summary(SpCond_site)
+car::Anova(SpCond_site)
+#check_model(SpCond_site) #great pp plot
+#simulate_residuals(SpCond_site)
+sp_site_lett<-emmeans(SpCond_site, ~Site_Num, type="response") %>%
+multcomp::cld(Letters = "abcdefghijk")
+
+#sp cond by all sites
+c1<-ggplot(all, aes(x=Site_Num, y=SpCond)) +
+  geom_boxplot(alpha=0.7) +
+    geom_text(
+    data = sp_site_lett,
+    aes(x = Site_Num, y = (response+12), label = .group),
+    size = 3)+
+  #geom_jitter()+
+  labs( x="All Sites", 
+         y =  expression(Specific~conductivity~(µg~L^-1)))+
+  #y = "Specific Conductivity (µg/L)") +
+  ylim(600,750)+ #removes 2 Belhurst points
+  theme_bw()+
+  theme(text = element_text(size = 12,family = "serif"))
+```
+## spcond ~ in/out
+```{r}
+#sp cond by in or out (treatments only)
+#convergence issues, cannot use interaction effect
+SpCondmod2 <- glmmTMB(
+  SpCond ~ Site_Num*in.out,
+  family = Gamma(link = "log"),
+  data = treatments)
+
+#Use this one
+SpCondmod3 <- glmmTMB(
+  SpCond ~ Site_Num+in.out +(1| sample_id),
+  family = Gamma(link = "log"),
+  data = treatments)
+summary(SpCondmod3)
+car::Anova(SpCondmod3)
+check_model(SpCondmod3)
+
+spcond_lett3<-emmeans(SpCondmod3, ~Site_Num, type="response") %>%
+multcomp::cld(Letters = "abcdefghijk")
+
+
+dodge_width <- 0.75 # same as default for geom_boxplot
+c1b<-ggplot(treatments, aes(x = Site_Num, y = SpCond, fill=in.out))+
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(
+    width = 0.15,
+    size = 1.5,
+    alpha = 0.8) +
+  ylim(620,700)+
+  labs(x="Pockmarks", 
+       y =  expression(Specific~conductivity~(µg~L^-1)))+
+  #y = "Specific Conductivity (µg/L)")+
+ # geom_text(
+ # data = spcond_lett2,
+ # aes(x = Site_Num, y = 698, label = .group),
+  #position = position_dodge(width = dodge_width),
+ # size = 3)+
+   scale_fill_discrete(labels = c("in" = "In",
+                                 "out" = "Out"))+
+  theme_bw() +
+  theme(text = element_text(size = 12,family = "serif"),
+    #axis.text.x = element_text(angle = 45, hjust = 1),
+   # axis.title.x= element_blank(),
+    legend.title = element_blank())
+```
+##spcond ~depth
+```{r}
+#sp cond by depth
+cl_depth <- lm(SpCond ~ Depth, data = all)
+summary(cl_depth)
+m_dep  <- coef(cl_depth)[2]  # slope
+b_dep  <- coef(cl_depth)[1]  # intercept
+r2_dep <- summary(cl_depth)$r.squared
+
+c2<-ggplot(all, aes(x =Depth, y=SpCond)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+  ylim(600,721)+
+  theme_bw() +
+  theme(text = element_text(size = 12,family = "serif"),
+        axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = "Depth (m)",
+       y =  expression(Specific~conductivity~(µg~L^-1)))+
+  annotate("text", 
+        x = -50, y = 675, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(m_dep, 2),
+                       "\nY-int = ", round(b_dep, 2),
+                          "\nR² = ", round(r2_dep, 2)))
+
+```
+#manuscript figs/tables
+```{r}
+#ggarrange(cond_cl_p,c3,c2,c1, nrow=2, ncol=2, labels="AUTO")
+
+#Figure 1: site map
+#Figure 2: cross section of lake
+#Figure 3
+Figure3<- ggarrange(p4, p1, p2, p3 ,nrow=2, ncol=2, align="hv", labels="auto")
+ggsave(
+  "Figure3.tiff",
+  plot = Figure3,
+  width = 3200,
+  height = 2000,
+  units = "px",
+  dpi = 300,
+  compression = "lzw")
+
+#Figure 4
+Figure4<-ggarrange(CH4_depth,CH4_DO,CH4_spcond, CH4_Turb, ncol=2, nrow=2, labels="auto")
+ggsave(
+  "Figure4.tiff",
+  plot = Figure4,
+  width = 3200,
+  height = 2000,
+  units = "px",
+  dpi = 300,
+  compression = "lzw")
+
+#Figure 5
+Figure5<-ggarrange(cond_cl_p,c2,c1,c1b, nrow=2, ncol=2, labels="auto", align="hv")
+ggsave(
+  "Figure5.tiff",
+  plot = Figure5,
+  width = 3200,
+  height = 2000,
+  units = "px",
+  dpi = 300,
+  compression = "lzw")
+
+#figure6; hypothetical examples
+
+#Table 1
+test<-glmmTMB(
+  cWat_0_corr ~ Site_Num * in.out + (1 | Site_Num/in.out),
+  family = Gamma(link="log"),
+  data = treatments) #excludes Abyssal and Belhurst
+summary(test)
+car::Anova(test, type=3)
+
+#Table 2
+test_m6 <- lmer(cWat_0_corr ~ Depth+ SpCond+ODOpercLocal+Turb+ (1 | Site_Num),data = all_clean)
+summary(test_m6)
+car::Anova(test_m6, type=3)
+```
+#Other EXO2 vars
+##stats
+```{r}
+#Normality not tested for at the moment! ANOVA (AOV) may not be appropriate 
+get_letters_anova <- function(df, response, y_offset = NULL) {
+  # build formula
+  f <- as.formula(paste(response, "~ Site_Num"))
+  # fit model
+  m <- aov(f, data = df)
+  # estimated marginal means + letters
+  cld_df <- cld(
+    emmeans(m, ~ Site_Num),
+    Letters = letters,
+    adjust = "tukey") %>%
+    as.data.frame()
+  # default y offset = 5% of data range
+  if (is.null(y_offset)) {
+    y_offset <- 0.05 * diff(range(df[[response]], na.rm = TRUE))}
+  # add y-position for plotting
+  cld_df <- cld_df %>%
+    left_join(
+      df %>%
+        group_by(Site_Num) %>%
+        summarise(
+          y = max(.data[[response]], na.rm = TRUE) +
+            y_offset,
+          .groups = "drop"),
+      by = "Site_Num" )
+  return(cld_df)
+}
+
+#depth_letters <- get_letters_anova(python5, "Depth")
+tds_letters <- get_letters_anova(all, "TDS")
+ph_letters   <- get_letters_anova(all, "pH")
+do_letters <- get_letters_anova(all, "ODOpercLocal")
+#cond_letters  <- get_letters_anova(python5, "Cond")
+turb_letters  <- get_letters_anova(all, "Turb")
+#cl_letters  <- get_letters_anova(python5, "Cl_mgL")
+
+#Differences in environmental variables among pockmarks were tested using one-way analyses of variance (ANOVA) when assumptions of approximate normality were met, and Kruskal–Wallis tests followed by Dunn’s post hoc comparisons for non-normal variables. Significance groupings were visualized using compact letter displays.
+```
+##Plots
+```{r}
+str(all)
+turb<-ggplot(all, aes(x=Site_Num, y=Turb)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+    geom_text(
+    data = turb_letters,
+    aes(x = Site_Num, y = y, label = .group),
+    size = 3.5,
+    vjust = 0)+
+ # scale_y_continuous(trans="log10") + 
+  labs(y="Turbidity (NFU)")+
+      # title="CH4 concentrations by Pockmark") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+TDS<- ggplot(all, aes(x=Site_Num, y=TDS)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+    geom_text(
+    data = tds_letters,
+    aes(x = Site_Num, y = y, label = .group),
+    size = 3.5,
+    vjust = 0)+
+ # scale_y_continuous(trans="log10") + 
+  labs(y="TDS")+
+      # title="CH4 concentrations by Pockmark") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+pH<- ggplot(all, aes(x=Site_Num, y=pH)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+ # ylim(-90,-55)+
+    geom_text(
+    data = ph_letters,
+    aes(x = Site_Num, y = y, label = .group),
+    size = 3.5,
+    vjust = 0)+
+ # scale_y_continuous(trans="log10") + 
+  labs(y="pH")+
+      # title="CH4 concentrations by Pockmark") +
+  theme_bw() +
+  theme(axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+DO<- ggplot(all, aes(x=Site_Num, y=ODOpercLocal)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+    geom_text(
+    data = do_letters,
+    aes(x = Site_Num, y = y, label = .group),
+    size = 3.5,
+    vjust = 0)+
+ # scale_y_continuous(trans="log10") + 
+  labs(y="DO (%)")+
+      # title="CH4 concentrations by Pockmark") +
+  theme_bw() +
+  theme(axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5))
+
+ggarrange(turb, TDS, DO, pH, nrow=2,ncol=2)
+
+```
+##in/out
+```{r}
+turb2<-ggplot(all, aes(x=Site_Num, y=Turb, fill=in.out)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+  labs(y="Turbidity (NFU)")+
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x=element_blank(),
+        legend.title=element_blank())
+
+TDS2<- ggplot(all, aes(x=Site_Num, y=TDS, fill=in.out)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+  labs(y="TDS (mg/L)")+
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x=element_blank(),
+        legend.title=element_blank())
+
+pH2<- ggplot(all, aes(x=Site_Num, y=pH, fill=in.out)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+ #ylim(-90,-55)+
+  labs(y="pH")+
+  theme_bw() +
+  theme(#axis.text.x = element_text(angle=45, hjust=1),
+        axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5),
+        legend.title=element_blank())
+
+DO2<- ggplot(all, aes(x=Site_Num, y=ODOpercLocal, fill=in.out)) +
+  geom_boxplot(alpha=0.7) +
+  geom_jitter(width=0.15, alpha=0.3) +
+  labs(y="DO (%)")+
+  theme_bw() +
+  theme(#axis.text.x = element_text(angle=45,  hjust=1),
+        axis.title.x=element_blank(),
+        plot.title=element_text(hjust=0.5),
+        legend.title=element_blank())
+
+ggarrange( turb2, TDS2, DO2, pH2, nrow=2,ncol=2)
+```
+#UNUSED_________________
+#with linear model
+```{r}
+break
+#this is pulling linear model for each one
+
+#methane ~ specific conductivity
+ch4_spcond_mod <- lm(cWat_0_corr2 ~ SpCond, data = all)
+summary(ch4_spcond_mod)
+m_sp  <- coef(ch4_spcond_mod)[2]  # slope
+b_sp  <- coef(ch4_spcond_mod)[1]  # intercept
+ch_r2_sp <- summary(ch4_spcond_mod)$r.squared
+
+CH4_spcond_p<-ggplot(all, aes(x=SpCond, y=cWat_0_corr2)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+ # ylim(4.656343e-11,1.024362e-10)+
+  #xlim(620,725)+
+  theme_bw() +
+  theme(text = element_text(size = 14,family = "serif"),
+        axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = "Specific conductivity (µg/L)",
+     y = expression(CH[4]~(nmol~mL^-1)))+
+  annotate("text", 
+        x = 725, y = 0.09, hjust = 1.1,
+        label = paste0("Slope = ", round(m_sp, 3),
+                       "\nY-int = ", round(b_sp, 2),
+                          "\nR² = ", round(ch_r2_sp, 2)))
+
+#methane by Depth
+ch4_depth <- lm(cWat_0_corr ~ Depth, data = all)
+summary(ch4_depth)
+m  <- coef(ch4_depth)[2]  # slope
+b  <- coef(ch4_depth)[1]  # intercept
+ch_r2 <- summary(ch4_depth)$r.squared
+
+CH4_depth<-ggplot(all, aes(x=Depth, y=cWat_0_corr2)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+  theme_bw() +
+  theme(text = element_text(size = 14,family = "serif"),
+        axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = "Depth (m)",
+     y = expression(CH[4]~(nmol~mL^-1)))+
+  annotate("text", 
+        x = -50, y = 0.08, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(m, 2),
+                       "\nY-int = ", round(b, 2),
+                          "\nR² = ", round(ch_r2, 2)))
+
+#methane ~ DO
+ch4_do <- lm(cWat_0_corr2 ~ ODOpercLocal, data = all)
+summary(ch4_do)
+m_do  <- coef(ch4_do)[2]  # slope
+b_do<- coef(ch4_do)[1]  # intercept
+do_r2 <- summary(ch4_do)$r.squared
+
+DO<-ggplot(all, aes(x=ODOpercLocal, y=cWat_0_corr2)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+  theme_bw() +
+  theme(text = element_text(size = 14,family = "serif"),
+        axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = "Dissolved Oxygen (%)",
+     y = expression(CH[4]~(nmol~mL^-1)))+
+  annotate("text", 
+        x = 102, y = 0.085, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(m_do,2),
+                       "\nY-int = ", round(b_do, 2),
+                          "\nR² = ", round(do_r2, 2)))
+#methane ~ turb
+ch4_turb <- lm(cWat_0_corr2 ~ Turb, data = all_clean)
+summary(ch4_turb)
+m_turb  <- coef(ch4_turb)[2]  # slope
+b_turb <- coef(ch4_turb)[1]  # intercept
+turb_r2 <- summary(ch4_turb)$r.squared
+
+Turb_plot<-ggplot(all_clean, aes(x=Turb, y=cWat_0_corr2)) +
+ geom_point() +
+  geom_smooth(method = "lm", se = TRUE,color = "black")+
+ # xlim(0,100)+
+  theme_bw()+
+  theme(text = element_text(size = 14,family = "serif"),
+      axis.text.x = element_text(hjust = 1),
+        plot.title = element_text(hjust=0.5))+
+  labs(x = "Turbidity (NFU)",
+     y = expression(CH[4]~(nmol~mL^-1)))+
+  annotate("text", 
+        x = 63, y = 0.065, hjust = 1.1, vjust = -0.5,
+        label = paste0("Slope = ", round(m_turb,2),
+                       "\nY-int = ", round(b_turb, 2),
+                          "\nR² = ", round(turb_r2, 2)))
+
+
+ggarrange(CH4_depth,DO,CH4_spcond_p, Turb_plot, ncol=2, nrow=2, labels="auto")
+```
