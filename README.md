@@ -80,3 +80,18 @@ Such findings would suggest that pockmarks may function as **persistent geochemi
 ---
 
 # Repository Contents
+```
+Seneca_Drums/
+├── Cl_Br.csv
+├── ProcessedConcs2.xlsx
+├── PythonRv2.csv
+├── README.md
+├── SenecaDrums_IsotopeRatioData.xlsx
+└── Seneca_drums2.Rmd
+```
+# File Descriptions
+- Cl_Br.csv: Chloride/ Bromide analysis results
+- ProcessedConcs2.xlsx: processed methane concentrations from the LI-7810
+- PythonRv2.csv: EXO2 sensor analysis for physiochemical variables from each Niskin sample, processed in Python
+- SenecaDrums_IsotopeRatioData.xlsx: methane concentrations from the Picarro
+- Seneca_drums2.Rmd: R code for processinig and analyzing all data
